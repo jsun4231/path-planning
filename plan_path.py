@@ -11,18 +11,20 @@ Map interpretation (read straight from the STEP B-rep, units = metres):
     Smaller disc = start, larger disc = goal.
 
 Output frame (top-down, matches the SolidWorks "Top" view):
-  x = CAD X,  y = -CAD Z,  origin at the inside corner of the arena, metres.
+  x = CAD X (east),  y = -CAD Z (north),  origin at the inside SW corner, metres.
 
 Method:
-  1. Exact clearance (distance-to-wall) field from the boundary polygon.
-  2. Drone footprint 0.50 m x 0.40 m -> circumscribed circle R = 0.320 m, so the
-     path is safe for ANY yaw. margin = clearance - R (gap from drone to wall).
-  3. A* on a 2 cm grid (16-connected) minimising
+  1. Exact signed distance from the drone footprint to the boundary polygon.
+     Default footprint (FOOTPRINT = "east"): the 0.50 m x 0.40 m drone at a fixed
+     yaw with its nose facing east, i.e. 0.40 m along x and 0.50 m along y.
+     margin = gap between that rectangle and the nearest wall.
+  2. A* on a 2 cm grid (16-connected) minimising
          cost = integral of [1 + W * ((T - margin)/T)^2]_(margin<T) ds
+                (+ a much steeper second tier below CRITICAL_MARGIN)
      i.e. path length, plus a penalty that grows as the margin drops below T.
-  4. Elastic-band refinement of the grid path with exact distance gradients
+  3. Elastic-band refinement of the grid path with exact margin gradients
      plus a small curvature term (smooth, fast-to-fly curve).
-  5. Douglas-Peucker simplification into straight-line waypoints, re-verified.
+  4. Douglas-Peucker simplification into straight-line waypoints, re-verified.
 """
 import csv
 import heapq
@@ -41,8 +43,17 @@ DRONE_WIDTH = 0.500   # m (lateral)
 DRONE_LENGTH = 0.400  # m (fore-aft)
 DRONE_RADIUS = 0.5 * math.hypot(DRONE_WIDTH, DRONE_LENGTH)  # 0.320 m
 
+# "east":   true 0.50 x 0.40 rectangle at a FIXED yaw, nose always facing east (+x):
+#           0.40 m along x, 0.50 m along y.
+# "travel": same rectangle, nose pointed along the direction of travel.
+# "circle": circumscribed 0.320 m circle - safe at ANY yaw, most conservative.
+FOOTPRINT = "east"
+EAST = np.array([1.0, 0.0])
+
 MARGIN_TARGET = 0.40  # m: margins above this carry no penalty
 MARGIN_WEIGHT = 3.0   # how strongly to trade length for margin below the target
+CRITICAL_MARGIN = 0.10  # m: below this an extra, much steeper penalty applies
+CRITICAL_WEIGHT = 30.0
 
 GRID = 0.02             # m, A* grid resolution
 BAND_SPACING = 0.05     # m, elastic-band point spacing
@@ -257,6 +268,11 @@ def margin_cost(m, weight=MARGIN_WEIGHT, target=MARGIN_TARGET):
     u = (target - m[soft]) / target
     c[soft] = 1 + weight * u ** 2
     dc[soft] = -2 * weight * u / target
+    # second, steeper tier for tight spots: squeeze out every mm at bottlenecks
+    tight = (m >= 0) & (m < CRITICAL_MARGIN) & (weight > 0)
+    v = (CRITICAL_MARGIN - m[tight]) / CRITICAL_MARGIN
+    c[tight] += CRITICAL_WEIGHT * v ** 2
+    dc[tight] += -2 * CRITICAL_WEIGHT * v / CRITICAL_MARGIN
     hard = m < 0                               # barrier: never let the drone touch
     c[hard] = 1 + weight + 1e5 * m[hard] ** 2
     dc[hard] = 2e5 * m[hard]
@@ -271,7 +287,11 @@ def grid_astar(walls, start, goal, weight):
     ys = np.arange(lo[1], hi[1] + GRID / 2, GRID)
     X, Y = np.meshgrid(xs, ys)
     P = np.column_stack([X.ravel(), Y.ravel()])
-    m = (walls.clearance(P) - DRONE_RADIUS).reshape(X.shape)
+    if FOOTPRINT == "travel":
+        # heading-free proxy (lateral half-width); the elastic band refines it
+        m = (walls.clearance(P) - DRONE_WIDTH / 2).reshape(X.shape)
+    else:  # exact for a circle or a fixed-yaw rectangle
+        m = footprint_margin(walls, P).reshape(X.shape)
     c, _ = margin_cost(m, weight=weight)
     c[m < 0] = np.inf
     ny, nx = c.shape
@@ -352,11 +372,14 @@ def elastic_band(walls, P, weight, iters=6000, step=1.0, max_move=0.003):
         L = np.linalg.norm(seg, axis=1)
         u = seg / L[:, None]
         mid = 0.5 * (P[1:] + P[:-1])
-        d, q = walls.nearest(mid)
-        inside = walls.inside(mid)
-        gm = (mid - q) / np.maximum(d, 1e-9)[:, None]
-        gm[~inside] *= -1
-        m = np.where(inside, d, -d) - DRONE_RADIUS
+        if FOOTPRINT == "circle":
+            d, q = walls.nearest(mid)
+            inside = walls.inside(mid)
+            gm = (mid - q) / np.maximum(d, 1e-9)[:, None]
+            gm[~inside] *= -1
+            m = np.where(inside, d, -d) - DRONE_RADIUS
+        else:  # rectangle (in "travel" mode the yaw gradient is neglected)
+            m, gm = rect_margin_grad(walls, mid, headings(mid, u))
         c, dc = margin_cost(m, weight=weight)
         g = np.zeros_like(P)
         gc = 0.5 * (dc * L)[:, None] * gm
@@ -380,24 +403,15 @@ def elastic_band(walls, P, weight, iters=6000, step=1.0, max_move=0.003):
     return resample(P, BAND_SPACING)
 
 
-def path_cost(walls, P, weight, h=0.01):
-    P = resample(P, h)
-    mid = 0.5 * (P[1:] + P[:-1])
-    L = np.linalg.norm(np.diff(P, axis=0), axis=1)
-    m = walls.clearance(mid) - DRONE_RADIUS
-    c, _ = margin_cost(m, weight=weight)
-    return float(c @ L)
-
-
-def douglas_peucker(P, tol, walls=None, slack_frac=0.05, slack_min=0.005):
+def douglas_peucker(P, tol, walls=None, slack_frac=0.05, slack_min=0.003):
     """Straight-line simplification. With `walls`, a chord is also rejected if it
     gives up more wall clearance than max(slack_min, slack_frac * local margin)
     versus the smooth path, so tight sections keep their centreline."""
     keep = np.zeros(len(P), bool)
     keep[0] = keep[-1] = True
     if walls is not None:
-        clear = walls.clearance(P)
-        slack = np.maximum(slack_min, slack_frac * (clear - DRONE_RADIUS))
+        clear = footprint_margin(walls, P)
+        slack = np.maximum(slack_min, slack_frac * clear)
     stack = [(0, len(P) - 1)]
     while stack:
         i, j = stack.pop()
@@ -409,7 +423,8 @@ def douglas_peucker(P, tol, walls=None, slack_frac=0.05, slack_min=0.005):
         chord = a + t[:, None] * ab
         bad = np.linalg.norm(P[i + 1:j] - chord, axis=1) / tol
         if walls is not None:
-            loss = (clear[i + 1:j] - walls.clearance(chord)) / slack[i + 1:j]
+            u = np.tile(ab / np.linalg.norm(ab), (len(chord), 1))
+            loss = (clear[i + 1:j] - footprint_margin(walls, chord, u)) / slack[i + 1:j]
             bad = np.maximum(bad, loss)
         k = int(np.argmax(bad))
         if bad[k] > 1:
@@ -422,26 +437,97 @@ def length(P):
     return float(np.sum(np.linalg.norm(np.diff(P, axis=0), axis=1)))
 
 
-def rect_margin(walls, P):
-    """Gap from the actual 0.50 x 0.40 rectangle to the walls when the drone's
-    nose points along the direction of travel (informational)."""
+def tangents(P):
     T = np.gradient(P, axis=0)
-    T /= np.linalg.norm(T, axis=1)[:, None]
-    N = np.column_stack([-T[:, 1], T[:, 0]])
+    return T / np.linalg.norm(T, axis=1)[:, None]
+
+
+def compass(U):
+    """Heading in degrees clockwise from north (+y): 0 = north, 90 = east (+x)."""
+    U = np.atleast_2d(U)
+    return np.degrees(np.arctan2(U[:, 0], U[:, 1])) % 360
+
+
+def rect_margin_grad(walls, P, U):
+    """Exact signed gap between the 0.50 x 0.40 drone rectangle (centre P, nose
+    along unit vector U) and the walls, and its gradient w.r.t. translation.
+    The gap between a convex rectangle and a polyline is attained either at a
+    rectangle corner or at a wall vertex, so both sets are checked."""
+    P, U = np.atleast_2d(P), np.atleast_2d(U)
+    n = len(P)
+    N = np.column_stack([-U[:, 1], U[:, 0]])
     hl, hw = DRONE_LENGTH / 2, DRONE_WIDTH / 2
-    out = np.empty(len(P))
-    for i, (p, t, n) in enumerate(zip(P, T, N)):
-        corners = np.array([p + hl * t + hw * n, p - hl * t + hw * n,
-                            p - hl * t - hw * n, p + hl * t - hw * n])
-        # sample rectangle perimeter densely, plus wall vertices against rectangle
-        edges = np.concatenate([np.linspace(corners[k], corners[(k + 1) % 4], 26)
-                                for k in range(4)])
-        d1, _ = walls.nearest(edges)
-        loc = walls.poly - p
-        lx, ly = np.abs(loc @ t) - hl, np.abs(loc @ n) - hw
-        d2 = np.hypot(np.maximum(lx, 0), np.maximum(ly, 0)) + np.minimum(np.maximum(lx, ly), 0)
-        out[i] = min(d1.min(), d2.min())
-    return out
+    rows = np.arange(n)
+
+    # rectangle corners -> walls (signed: negative if a corner is inside a wall)
+    sg = np.array([[1, 1], [-1, 1], [-1, -1], [1, -1]], float)
+    C = (P[:, None, :] + sg[None, :, :1] * hl * U[:, None, :]
+         + sg[None, :, 1:] * hw * N[:, None, :]).reshape(-1, 2)
+    d, q = walls.nearest(C)
+    ins = walls.inside(C)
+    cm = np.where(ins, d, -d).reshape(n, 4)
+    cg = ((C - q) / np.maximum(d, 1e-12)[:, None] * np.where(ins, 1, -1)[:, None]).reshape(n, 4, 2)
+    k = cm.argmin(axis=1)
+    m1, g1 = cm[rows, k], cg[rows, k]
+
+    # wall vertices -> rectangle (box signed distance; negative if vertex pokes in)
+    rel = walls.poly[None] - P[:, None]
+    lx = np.einsum("nkj,nj->nk", rel, U)
+    ly = np.einsum("nkj,nj->nk", rel, N)
+    qx, qy = np.abs(lx) - hl, np.abs(ly) - hw
+    ox, oy = np.maximum(qx, 0), np.maximum(qy, 0)
+    out = np.hypot(ox, oy)
+    sdf = out + np.minimum(np.maximum(qx, qy), 0)
+    k = sdf.argmin(axis=1)
+    m2 = sdf[rows, k]
+    sx, sy = np.sign(lx[rows, k]), np.sign(ly[rows, k])
+    o = out[rows, k]
+    gx = np.where(o > 0, ox[rows, k] * sx / np.maximum(o, 1e-12), np.where(qx[rows, k] > qy[rows, k], sx, 0))
+    gy = np.where(o > 0, oy[rows, k] * sy / np.maximum(o, 1e-12), np.where(qx[rows, k] > qy[rows, k], 0, sy))
+    g2 = -(gx[:, None] * U + gy[:, None] * N)   # moving the rectangle, not the vertex
+
+    use1 = m1 <= m2
+    return np.where(use1, m1, m2), np.where(use1[:, None], g1, g2)
+
+
+def headings(P, U=None):
+    """Nose direction of the drone at each point, per FOOTPRINT."""
+    if FOOTPRINT == "east":
+        return np.tile(EAST, (len(P), 1))
+    return tangents(P) if U is None else U
+
+
+def footprint_margin(walls, P, U=None, chunk=2000):
+    """Gap from the drone footprint to the walls (see FOOTPRINT). U is the
+    direction of travel; it is ignored in fixed-heading mode."""
+    P = np.atleast_2d(P)
+    if FOOTPRINT == "circle":
+        return walls.clearance(P) - DRONE_RADIUS
+    U = headings(P, U)
+    return np.concatenate([rect_margin_grad(walls, P[s:s + chunk], U[s:s + chunk])[0]
+                           for s in range(0, len(P), chunk)])
+
+
+def waypoint_margins(walls, W, step=0.005):
+    """For straight-line waypoint flight with the nose along each leg: the worst
+    gap on each leg, and the worst gap while yawing in place at each waypoint."""
+    legs = W[1:] - W[:-1]
+    Ul = legs / np.linalg.norm(legs, axis=1)[:, None]
+    leg_min = []
+    for a, b, u in zip(W[:-1], W[1:], Ul):
+        n = max(2, int(np.linalg.norm(b - a) / step) + 1)
+        seg = a + np.linspace(0, 1, n)[:, None] * (b - a)
+        leg_min.append(float(footprint_margin(walls, seg, np.tile(u, (n, 1))).min()))
+    at_wp = []
+    for i, p in enumerate(W):
+        u_in = Ul[i - 1] if i > 0 else Ul[0]
+        u_out = Ul[i] if i < len(Ul) else Ul[-1]
+        a0, a1 = math.atan2(u_in[1], u_in[0]), math.atan2(u_out[1], u_out[0])
+        da = (a1 - a0 + math.pi) % (2 * math.pi) - math.pi
+        ang = a0 + da * np.linspace(0, 1, 13)
+        Us = np.column_stack([np.cos(ang), np.sin(ang)])
+        at_wp.append(float(footprint_margin(walls, np.tile(p, (13, 1)), Us).min()))
+    return np.array(at_wp), np.array([np.nan] + leg_min)
 
 
 # ---------------------------------------------------------------- plotting
@@ -458,27 +544,31 @@ def plot(walls, markers, path, waypoints, shortest, fname):
     ax.add_patch(Rectangle(lo, *(hi - lo), color="#555"))
     ax.add_patch(Polygon(poly, closed=True, facecolor="white", edgecolor="black", lw=1))
 
-    xs = np.arange(lo[0], hi[0], 0.01)
-    ys = np.arange(lo[1], hi[1], 0.01)
-    X, Y = np.meshgrid(xs, ys)
-    C = walls.clearance(np.column_stack([X.ravel(), Y.ravel()])).reshape(X.shape)
-    ax.contourf(X, Y, C, levels=[0, DRONE_RADIUS], colors=["#f6c9c9"])
-    ax.contour(X, Y, C, levels=[DRONE_RADIUS], colors=["#d55"], linewidths=0.8,
-               linestyles="--")
+    if FOOTPRINT != "travel":  # keep-out zone for the drone centre (exact here)
+        xs = np.arange(lo[0], hi[0], 0.015)
+        ys = np.arange(lo[1], hi[1], 0.015)
+        X, Y = np.meshgrid(xs, ys)
+        G = np.column_stack([X.ravel(), Y.ravel()])
+        inside = walls.inside(G)
+        C = np.full(len(G), -1.0)
+        C[inside] = footprint_margin(walls, G[inside])
+        C = C.reshape(X.shape)
+        ax.contourf(X, Y, np.where(walls.inside(G).reshape(X.shape), C, 1), levels=[-1, 0],
+                    colors=["#f6c9c9"])
+        ax.contour(X, Y, C, levels=[0], colors=["#d55"], linewidths=0.8, linestyles="--")
 
-    ax.plot(*shortest.T, color="#999", lw=1, ls=":", label="shortest feasible (no margin)")
+    ax.plot(*shortest.T, color="#999", lw=1, ls=":", label="shortest path (hugs walls, reference)")
 
-    m = walls.clearance(path) - DRONE_RADIUS
+    m = footprint_margin(walls, path)
     segs = np.stack([path[:-1], path[1:]], axis=1)
     lc = LineCollection(segs, cmap="viridis", linewidths=3)
     lc.set_array(0.5 * (m[:-1] + m[1:]))
     ax.add_collection(lc)
     cb = fig.colorbar(lc, ax=ax, fraction=0.035, pad=0.02)
-    cb.set_label("margin: drone envelope to wall (m)")
+    cb.set_label("margin: drone footprint to wall (m)")
 
-    # drone footprint every ~0.6 m, nose along travel
-    T = np.gradient(path, axis=0)
-    T /= np.linalg.norm(T, axis=1)[:, None]
+    # drone footprint every ~0.6 m
+    T = headings(path)
     step = max(1, int(round(0.6 / DENSE_SPACING)))
     for i in list(range(0, len(path), step)) + [len(path) - 1]:
         t = T[i]
@@ -488,8 +578,10 @@ def plot(walls, markers, path, waypoints, shortest, fname):
         corners = [p + hl * t + hw * n, p - hl * t + hw * n, p - hl * t - hw * n, p + hl * t - hw * n]
         ax.add_patch(Polygon(corners, closed=True, fill=False, edgecolor="#1f77b4", lw=0.6,
                              alpha=0.7))
-        ax.add_patch(Circle(p, DRONE_RADIUS, fill=False, edgecolor="#1f77b4", lw=0.3,
-                            alpha=0.35))
+        ax.plot(*np.array([p, p + hl * t]).T, color="#1f77b4", lw=0.6, alpha=0.7)  # nose
+        if FOOTPRINT == "circle":
+            ax.add_patch(Circle(p, DRONE_RADIUS, fill=False, edgecolor="#1f77b4", lw=0.3,
+                                alpha=0.35))
 
     ax.plot(*waypoints.T, "o", color="black", ms=3.5, zorder=5)
     for k, w in enumerate(waypoints):
@@ -508,7 +600,9 @@ def plot(walls, markers, path, waypoints, shortest, fname):
     ax.set_aspect("equal")
     ax.set_xlabel("x (m)  [= CAD X]")
     ax.set_ylabel("y (m)  [= -CAD Z]")
-    ax.set_title("Drone path (pink = unreachable by drone centre)")
+    mode = {"east": "fixed yaw, nose east", "travel": "nose along travel",
+            "circle": "any yaw"}[FOOTPRINT]
+    ax.set_title(f"Drone path ({mode}; pink = unreachable by drone centre)")
     ax.grid(alpha=0.2)
     ax.legend(loc="upper right", fontsize=8)
     fig.tight_layout()
@@ -528,45 +622,40 @@ def main():
     print(f"floor face #{floor_id}: boundary with {len(boundary)} vertices")
     print(f"start marker (smaller, r={r_s*1000:.0f} mm): ({start[0]:.3f}, {start[1]:.3f})")
     print(f"goal  marker (larger,  r={r_g*1000:.0f} mm): ({goal[0]:.3f}, {goal[1]:.3f})")
+    print(f"footprint model: {FOOTPRINT}")
     for name, p in [("start", start), ("goal", goal)]:
-        cl = walls.clearance(p)[0]
-        print(f"  {name}: clearance {cl:.3f} m -> margin {cl - DRONE_RADIUS:.3f} m")
+        print(f"  {name}: margin {footprint_margin(walls, p)[0]*1000:.0f} mm")
 
     smooth = plan(walls, start, goal, MARGIN_WEIGHT)
     shortest = plan(walls, start, goal, 0.0)
 
     dense = resample(smooth, DENSE_SPACING)
     wps = douglas_peucker(resample(smooth, 0.01), WAYPOINT_TOL, walls)
+    wm, leg = waypoint_margins(walls, wps)
 
-    def stats(P, label):
+    def stats(P, label, m=None):
         Pf = resample(P, 0.005)
-        m = walls.clearance(Pf) - DRONE_RADIUS
+        if m is None:
+            m = footprint_margin(walls, Pf)
         k = int(np.argmin(m))
         print(f"{label:<28} length {length(P):6.2f} m   min margin {m.min()*1000:5.0f} mm "
               f"at ({Pf[k,0]:.2f}, {Pf[k,1]:.2f})")
-        return m
 
     print()
-    stats(shortest, "shortest feasible path")
+    stats(shortest, "shortest path (hugs walls)")
     stats(smooth, "planned path (smooth)")
-    stats(wps, "planned path (waypoints)")
-    rm = rect_margin(walls, resample(wps, 0.02))
-    print(f"rectangle footprint, nose along travel: min margin {rm.min()*1000:.0f} mm")
+    print(f"{'planned path (waypoints)':<28} length {length(wps):6.2f} m   min margin "
+          f"{np.nanmin(np.concatenate([wm, leg]))*1000:5.0f} mm")
+    any_yaw = walls.clearance(resample(wps, 0.005)) - DRONE_RADIUS
+    print(f"(for reference, worst case at ANY yaw on this path: {any_yaw.min()*1000:.0f} mm)")
 
-    wm = walls.clearance(wps) - DRONE_RADIUS
-    # worst margin along the straight leg that arrives at each waypoint
-    leg = [float("nan")]
-    for a, b in zip(wps[:-1], wps[1:]):
-        n = max(2, int(np.linalg.norm(b - a) / 0.005) + 1)
-        seg = a + np.linspace(0, 1, n)[:, None] * (b - a)
-        leg.append(float((walls.clearance(seg) - DRONE_RADIUS).min()))
     with open(HERE / "path_waypoints.csv", "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["idx", "x_m", "y_m", "margin_m", "leg_min_margin_m"])
         for i, (p, mm, lm) in enumerate(zip(wps, wm, leg)):
             w.writerow([i, f"{p[0]:.3f}", f"{p[1]:.3f}", f"{mm:.3f}",
                         "" if i == 0 else f"{lm:.3f}"])
-    dm = walls.clearance(dense) - DRONE_RADIUS
+    dm = footprint_margin(walls, dense)
     with open(HERE / "path_dense.csv", "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["idx", "x_m", "y_m", "margin_m"])
